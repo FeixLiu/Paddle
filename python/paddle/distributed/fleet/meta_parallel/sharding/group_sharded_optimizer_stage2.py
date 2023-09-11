@@ -50,6 +50,12 @@ align = {
 }
 
 
+class MasterParamWarper(core.eager.Tensor):
+    def __init__(self):
+        super().__init__()
+        self.main_grad = None
+
+
 class GroupShardedOptimizerStage2(Optimizer):
     """
     A wrapper for Sharding Stage2 Optimizer in Dygraph.
@@ -115,12 +121,32 @@ class GroupShardedOptimizerStage2(Optimizer):
         else:
             self._local_params.extend(list(params))
 
+        self.use_main_grad = None
+        for param in self._local_params:
+            if self.use_main_grad is None and hasattr(param, "main_grad"):
+                self.use_main_grad = True
+            if self.use_main_grad:
+                assert hasattr(
+                    param, "main_grad"
+                ), "Params have different main grad attributes."
+
         self._default_device = device
         self._pfp16 = (
             len(
                 list(
                     filter(
                         lambda x: x.trainable and x.dtype == Type.fp16.value,
+                        self._local_params,
+                    )
+                )
+            )
+            > 0
+        )
+        self._pbf16 = (
+            len(
+                list(
+                    filter(
+                        lambda x: x.trainable and x.dtype == Type.bf16.value,
                         self._local_params,
                     )
                 )
@@ -188,8 +214,8 @@ class GroupShardedOptimizerStage2(Optimizer):
 
         if offload:
             assert (
-                self._pfp16
-            ), "Only support offload strategy while using \'Adam\', \'AdamW\' and \'Momentum\' optimizer with AMP/Pure FP16"
+                self._pfp16 or self._pbf16
+            ), "Only support offload strategy while using \'Adam\', \'AdamW\' and \'Momentum\' optimizer with AMP/Pure FP16/BF16"
 
         self.offload = offload  # Using for offload
         self.offload_device = "cpu"
@@ -292,9 +318,19 @@ class GroupShardedOptimizerStage2(Optimizer):
                         place=core.CPUPlace(),
                         stop_gradient=param.stop_gradient,
                     )
+                if self.use_main_grad:
+                    main_grad_warper = MasterParamWarper()
+                    grad_tensor = self._master_params[param.name]
+                    main_grad_warper.get_tensor()._share_data_with(
+                        grad_tensor.get_tensor()
+                    )
+                    self._master_params[param.name] = main_grad_warper
         else:
             for param in trainable_params:
-                if param.dtype == Type.fp16.value:
+                if (
+                    param.dtype == Type.fp16.value
+                    or param.dtype == Type.bf16.value
+                ):
                     master_tensor = paddle.cast(param, Type.fp32.value)
                     master_tensor.name = param.name
                     self._optim._master_weights[param.name] = master_tensor
@@ -421,7 +457,7 @@ class GroupShardedOptimizerStage2(Optimizer):
                     trainable_params = list(
                         filter(lambda x: x.trainable, params)
                     )
-                    if self._pfp16 and dst_rank == self._rank:
+                    if (self._pfp16 or self._pbf16) and dst_rank == self._rank:
                         self._generate_master_params(trainable_params)
                     if trainable_params:
                         param_storage = ParamStorage(
@@ -473,6 +509,9 @@ class GroupShardedOptimizerStage2(Optimizer):
                         cpu_master_params, self.offload_param2align, False
                     )
                     self.offload_params.buffer.stop_gradient = False
+                    if self.use_main_grad:
+                        self.offload_params.warp_buffer()
+                        self.offload_params.buffer.main_grad = None
 
                     self.offload_grads = GradStorage(
                         size=self.offload_buffer_size,
@@ -495,12 +534,22 @@ class GroupShardedOptimizerStage2(Optimizer):
         """accumulate grads with offload strategy"""
         with device_guard(self._rank, self.offload_device):
             if param_name in self._master_params.keys():
-                if self._master_params[param_name].grad is None:
-                    self._master_params[param_name]._copy_gradient_from(
-                        grad_fp32_cpu
-                    )
+                if self.use_main_grad:
+                    if self._master_params[param_name].main_grad is None:
+                        self._master_params[param_name]._copy_gradient_from(
+                            grad_fp32_cpu
+                        )
+                    else:
+                        self._master_params[param_name].main_grad.add_(
+                            grad_fp32_cpu
+                        )
                 else:
-                    self._master_params[param_name].grad.add_(grad_fp32_cpu)
+                    if self._master_params[param_name].grad is None:
+                        self._master_params[param_name]._copy_gradient_from(
+                            grad_fp32_cpu
+                        )
+                    else:
+                        self._master_params[param_name].grad.add_(grad_fp32_cpu)
 
         self.offload_params.buffer._copy_gradient_from(
             self.offload_grads.buffer
